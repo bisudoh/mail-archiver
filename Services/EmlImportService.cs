@@ -478,6 +478,8 @@ namespace MailArchiver.Services
                 // Extract text and HTML body preserving original encoding
                 var body = string.Empty;
                 var htmlBody = string.Empty;
+                var bodyUntruncatedText = string.Empty;
+                var bodyUntruncatedHtml = string.Empty;
                 var isHtmlTruncated = false;
                 var isBodyTruncated = false;
 
@@ -490,6 +492,9 @@ namespace MailArchiver.Services
                     if (Encoding.UTF8.GetByteCount(cleanedTextBody) > 500_000)
                     {
                         isBodyTruncated = true;
+                        // Store original in untruncated column
+                        bodyUntruncatedText = cleanedTextBody;
+                        // Store truncated version for search index
                         body = TruncateTextForStorage(cleanedTextBody, 500_000);
                     }
                     else
@@ -506,6 +511,9 @@ namespace MailArchiver.Services
                     if (Encoding.UTF8.GetByteCount(cleanedHtmlAsText) > 500_000)
                     {
                         isBodyTruncated = true;
+                        // Store original in untruncated column
+                        bodyUntruncatedText = cleanedHtmlAsText;
+                        // Store truncated version for search index
                         body = TruncateTextForStorage(cleanedHtmlAsText, 500_000);
                     }
                     else
@@ -517,15 +525,19 @@ namespace MailArchiver.Services
                 // Handle HTML body - preserve original encoding
                 if (!string.IsNullOrEmpty(message.HtmlBody))
                 {
-                    // Check if HTML body will be truncated
-                    isHtmlTruncated = message.HtmlBody.Length > 1_000_000;
-                    if (isHtmlTruncated)
+                    var cleanedHtmlBody = CleanText(message.HtmlBody);
+                    // Check if HTML body needs truncation
+                    if (Encoding.UTF8.GetByteCount(cleanedHtmlBody) > 1_000_000)
                     {
-                        htmlBody = CleanHtmlForStorage(message.HtmlBody);
+                        isHtmlTruncated = true;
+                        // Store original in untruncated column
+                        bodyUntruncatedHtml = cleanedHtmlBody;
+                        // Store truncated version for search index
+                        htmlBody = CleanHtmlForStorage(cleanedHtmlBody);
                     }
                     else
                     {
-                        htmlBody = CleanText(message.HtmlBody); // Apply CleanText to remove null bytes and control characters
+                        htmlBody = cleanedHtmlBody;
                     }
                 }
 
@@ -592,10 +604,13 @@ namespace MailArchiver.Services
                     SentDate = convertedSentDate,
                     ReceivedDate = DateTime.UtcNow,
                     IsOutgoing = DetermineIfOutgoing(message, account),
-                    HasAttachments = allAttachments.Any() || isHtmlTruncated || isBodyTruncated,
+                    HasAttachments = allAttachments.Any(),
                     Body = body,
                     HtmlBody = htmlBody,
-                    FolderName = targetFolder
+                    BodyUntruncatedText = !string.IsNullOrEmpty(bodyUntruncatedText) ? bodyUntruncatedText : null,
+                    BodyUntruncatedHtml = !string.IsNullOrEmpty(bodyUntruncatedHtml) ? bodyUntruncatedHtml : null,
+                    FolderName = targetFolder,
+                    Attachments = new List<EmailAttachment>() // Initialize collection for hash calculation
                 };
 
                 _logger.LogDebug("Job {JobId}: Adding email to database: {MessageId}", job.JobId, messageId);
@@ -611,26 +626,8 @@ namespace MailArchiver.Services
                     await SaveAllAttachments(context, allAttachments, archivedEmail.Id);
                 }
 
-                // If HTML was truncated, save the original HTML as an attachment
-                if (isHtmlTruncated)
-                {
-                    // Save the UTF-8 encoded HTML
-                    var htmlBytes = Encoding.UTF8.GetBytes(message.HtmlBody);
-                    var utf8Html = Encoding.UTF8.GetString(htmlBytes);
-                    await SaveTruncatedHtmlAsAttachment(context, utf8Html, archivedEmail.Id, job.JobId, messageId);
-                }
-
-                // If Body was truncated, save the original text content as an attachment
-                if (isBodyTruncated)
-                {
-                    var originalTextContent = !string.IsNullOrEmpty(message.TextBody) ? message.TextBody : message.HtmlBody;
-                    if (!string.IsNullOrEmpty(originalTextContent))
-                    {
-                        await SaveTruncatedTextAsAttachment(context, originalTextContent, archivedEmail.Id, job.JobId, messageId);
-                    }
-                }
-
-                _logger.LogDebug("Job {JobId}: Successfully imported email: {MessageId}", job.JobId, messageId);
+                _logger.LogDebug("Job {JobId}: Successfully imported email: {MessageId}, Truncated: {IsTruncated}", 
+                    job.JobId, messageId, isHtmlTruncated || isBodyTruncated ? "Yes" : "No");
                 return ImportResult.CreateSuccess();
             }
             catch (Exception ex)
